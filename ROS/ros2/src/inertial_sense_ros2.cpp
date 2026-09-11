@@ -30,6 +30,11 @@
 //#include "ISMatrix.h"
 
 #include "ParamHelper.h"
+#include <ctime>
+#include <cstdlib>
+#include <set>
+
+InertialSenseROS* InertialSenseROS::s_isb_owner_ = nullptr;
 
 #define STREAMING_CHECK(streaming, DID)      if (!streaming){ streaming = true; rclcpp::Logger logger_IS_resp_rec = rclcpp::get_logger("IS_response_received"); logger_IS_resp_rec.set_level(rclcpp::Logger::Level::Debug); RCLCPP_DEBUG(logger_IS_resp_rec,"InertialSenseROS: %s response received", cISDataMappings::DataName(DID)); }
 //#define STREAMING_CHECK(streaming, DID)      if (!streaming){ streaming = true; RCLCPP_DEBUG("InertialSenseROS: %s response received", cISDataMappings::DataName(DID)); }
@@ -49,16 +54,14 @@ void odometryIdentity(nav_msgs::msg::Odometry& msg_odom) {
 
 InertialSenseROS::InertialSenseROS(YAML::Node paramNode, bool configFlashParameters): nh_(rclcpp::Node::make_shared("nh_"))
 {
+    s_isb_owner_ = this;
+
     // Should always be enabled by default
     rs_.did_ins1.enabled = true;
     rs_.did_ins1.topic = "did_ins1";
     rs_.gps1.enabled = true;
     rs_.gps1.topic = "/gps";
 
-   //if (ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Debug))
-   //{
-   //    ros::console::notifyLoggerLevelsChanged();
-   //}
     load_params(paramNode);
 }
 
@@ -82,11 +85,13 @@ void InertialSenseROS::initialize(bool configFlashParameters)
 
 void InertialSenseROS::terminate()
 {
+    ntrip_.reset();
+    rtk_server_.reset();
+    resetDeviceBinding();
+    if (s_isb_owner_ == this)
+        s_isb_owner_ = nullptr;
     IS_.Close();
-    IS_.CloseServerConnection();
     sdk_connected_ = false;
-
-    // ROS equivalent to shutdown advertisers, etc.
 }
 
 void InertialSenseROS::initializeIS(bool configFlashParameters)
@@ -111,7 +116,7 @@ void InertialSenseROS::initializeIS(bool configFlashParameters)
         IS_.StopBroadcasts(true);
         initializeROS();
         configure_data_streams(true);
-        //configure_rtk();
+        configure_rtk();
         IS_.SavePersistent();
 
         if (configFlashParameters)
@@ -163,7 +168,7 @@ void InertialSenseROS::initializeROS()
         rs_.rtk_pos.pubInfo = nh_->create_publisher<inertial_sense_ros2::msg::RTKInfo>("RTK_pos/info", 10);
         rs_.rtk_pos.pubRel = nh_->create_publisher<inertial_sense_ros2::msg::RTKRel>("RTK_pos/rel", 10);
     }
-    if (GNSS_Compass_)
+    if (RTK_rover_ && RTK_rover_->compassing_enable)
     {
         rs_.rtk_cmp.pubInfo = nh_->create_publisher<inertial_sense_ros2::msg::RTKInfo>("RTK_cmp/info", 10);
         rs_.rtk_cmp.pubRel = nh_->create_publisher<inertial_sense_ros2::msg::RTKRel>("RTK_cmp/rel", 10);
@@ -197,7 +202,7 @@ void InertialSenseROS::initializeROS()
     if (rs_.diagnostics.enabled)
     {
         rs_.diagnostics.pub_diagnostics = nh_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("diagnostics", 1);
-        diagnostics_timer_ = nh_->create_timer(0.5s, std::bind(InertialSenseROS::diagnostics_callback, this)); // 2 Hz
+        diagnostics_timer_ = nh_->create_wall_timer(0.5s, std::bind(&InertialSenseROS::diagnostics_callback, this)); // 2 Hz
     }
 
     data_stream_timer_ = nh_->create_wall_timer(1s, [this]() { this->configure_data_streams(false); });
@@ -359,7 +364,7 @@ void InertialSenseROS::load_params(YAML::Node &node)
 
     bool did_ins1_enable = nh_->declare_parameter<bool>("msg/did_ins1/enable", false);
     int did_ins1_period = nh_->declare_parameter<int>("msg/did_ins1/period", 1);
-    ph.msgParams(rs_.did_ins1, "msg/did_ins1/enable", "ins_eul_uvw_ned", false, did_ins1_period, did_ins1_enable);
+    ph.msgParams(rs_.did_ins1, "did_ins1", "ins_eul_uvw_ned", false, did_ins1_period, did_ins1_enable);
 
     bool did_ins2_enable = nh_->declare_parameter<bool>("msg/did_ins2/enable", false);
     int did_ins2_period = nh_->declare_parameter<int>("msg/did_ins2/period", 1);
@@ -451,6 +456,7 @@ void InertialSenseROS::load_params(YAML::Node &node)
     YAML::Node rtkRoverNode = ph.node(node, "rtk_rover");
     if (rtkRoverNode.IsDefined() && !rtkRoverNode.IsNull())
         RTK_rover_ = new RtkRoverProvider(rtkRoverNode);
+    GNSS_Compass_ = (RTK_rover_ != nullptr) && RTK_rover_->compassing_enable;
 
     YAML::Node rtkBaseNode = ph.node(node, "rtk_base");
     if (rtkBaseNode.IsDefined() && !rtkBaseNode.IsNull())
@@ -574,7 +580,10 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
     CONFIG_STREAM(rs_.inl2_states, DID_INL2_STATES, inl2_states_t, INL2_states_callback);
 
     nvm_flash_cfg_t flashCfg;
-    IS_.ImxFlashConfig(flashCfg);
+    if (device_)
+        device_->ImxFlashConfig(flashCfg);
+    else
+        IS_.ImxFlashConfig(flashCfg);
     if (!NavSatFixConfigured)
     {
         if (rs_.gps1_navsatfix.enabled) {
@@ -673,6 +682,66 @@ void InertialSenseROS::configure_ascii_output()
     //  IS_.SendData(DID_NMEA_BCAST_PERIOD, (uint8_t*)(&msgs), sizeof(nmea_msgs_t), 0);
 }
 
+void InertialSenseROS::resetDeviceBinding()
+{
+    isb_handler_installed_ = false;
+    device_.reset();
+}
+
+bool InertialSenseROS::bindConnectedDevice()
+{
+    device_handle_t fallback;
+    for (auto& d : IS_.getDevices())
+    {
+        if (!(d && d->isConnected() && d->hasDeviceInfo()))
+            continue;
+        if (d->DeviceInfo().hardwareType == IS_HARDWARE_TYPE_IMX)
+        {
+            device_ = d;
+            return true;
+        }
+        if (!fallback)
+            fallback = d;
+    }
+    if (fallback)
+    {
+        device_ = fallback;
+        return true;
+    }
+    return false;
+}
+
+void InertialSenseROS::ensureIsbHandler()
+{
+    if (!device_ || isb_handler_installed_)
+        return;
+    s_isb_owner_ = this;
+    device_->registerIsbDataHandler(&InertialSenseROS::isbDispatchThunk);
+    isb_handler_installed_ = true;
+}
+
+int InertialSenseROS::isbDispatchThunk(void* ctx, p_data_t* data, port_handle_t port)
+{
+    if (s_isb_owner_)
+        return s_isb_owner_->isbDispatch(ctx, data, port);
+    if (ctx)
+        static_cast<ISDevice*>(ctx)->onIsbDataHandler(data, port);
+    return 0;
+}
+
+int InertialSenseROS::isbDispatch(void* ctx, p_data_t* data, port_handle_t port)
+{
+    (void)port;
+    if (ctx)
+        static_cast<ISDevice*>(ctx)->onIsbDataHandler(data, port);
+    if (!data)
+        return 0;
+    auto it = did_callbacks_.find(data->hdr.id);
+    if (it != did_callbacks_.end() && it->second)
+        it->second(data);
+    return 0;
+}
+
 /**
  * Connects to the Inertial Sense hardware
  * Will attempt to connect using a list of multiple ports if specified,
@@ -681,26 +750,38 @@ void InertialSenseROS::configure_ascii_output()
  */
 bool InertialSenseROS::connect(float timeout)
 {
+    resetDeviceBinding();
     uint32_t end_time = nh_->now().seconds() + timeout;
     auto ports_iterator = ports_.begin();
 
     do {
         std::string cur_port = *ports_iterator;
-        /// Connect to the IMX
         RCLCPP_INFO(rclcpp::get_logger("connect_to_serial"),"InertialSenseROS: Connecting to serial port \"%s\", at %d baud", cur_port.c_str(), baudrate_);
         sdk_connected_ = IS_.Open(cur_port.c_str(), baudrate_);
         if (!sdk_connected_) {
             RCLCPP_ERROR(rclcpp::get_logger("open_port_error"),"InertialSenseROS: Unable to open serial port \"%s\", at %d baud", cur_port.c_str(), baudrate_);
-            sleep(1); // is this a good idea?
+            sleep(1);
         } else {
-            RCLCPP_INFO(rclcpp::get_logger("serial_port_connected_info"),"InertialSenseROS: Connected to IMX SN%d on \"%s\", at %d baud", IS_.DeviceInfo().serialNumber, cur_port.c_str(), baudrate_);
-            port_ = cur_port;
-            break;
+            while (nh_->now().seconds() < end_time) {
+                IS_.Update();
+                if (bindConnectedDevice()) {
+                    ensureIsbHandler();
+                    const dev_info_t& info = device_->DeviceInfo();
+                    RCLCPP_INFO(rclcpp::get_logger("serial_port_connected_info"),"InertialSenseROS: Connected to IMX SN%d on \"%s\", at %d baud", info.serialNumber, cur_port.c_str(), baudrate_);
+                    port_ = cur_port;
+                    return true;
+                }
+                usleep(10000);
+            }
+            RCLCPP_ERROR(rclcpp::get_logger("open_port_error"),"InertialSenseROS: Opened \"%s\" but no ISDevice with device info was discovered", cur_port.c_str());
+            IS_.Close();
+            sdk_connected_ = false;
+            resetDeviceBinding();
         }
         if ((ports_.size() > 1) && (ports_iterator != ports_.end()))
             ports_iterator++;
         else
-            ports_iterator = ports_.begin(); // just keep looping until we timeout below
+            ports_iterator = ports_.begin();
     } while (nh_->now().seconds() < end_time);
 
     return sdk_connected_;
@@ -708,13 +789,17 @@ bool InertialSenseROS::connect(float timeout)
 
 bool InertialSenseROS::firmware_compatiblity_check()
 {
+    if (!device_)
+        return false;
+
+    const dev_info_t& info = device_->DeviceInfo();
     char local_protocol[4] = { PROTOCOL_VERSION_CHAR0, PROTOCOL_VERSION_CHAR1, PROTOCOL_VERSION_CHAR2, PROTOCOL_VERSION_CHAR3 };
     char diff_protocol[4] = { 0, 0, 0, 0 };
-    for (int i = 0; i < sizeof(local_protocol); i++)  diff_protocol[i] = local_protocol[i] - IS_.DeviceInfo().protocolVer[i];
+    for (int i = 0; i < sizeof(local_protocol); i++)  diff_protocol[i] = local_protocol[i] - info.protocolVer[i];
 
     char local_firmware[3] = { IS_SDK_VERSION_MAJOR, IS_SDK_VERSION_MINOR, IS_SDK_VERSION_REVIS };
     char diff_firmware[3] = { 0, 0 ,0 };
-    for (int i = 0; i < sizeof(local_firmware); i++)  diff_firmware[i] = local_firmware[i] - IS_.DeviceInfo().firmwareVer[i];
+    for (int i = 0; i < sizeof(local_firmware); i++)  diff_firmware[i] = local_firmware[i] - info.firmwareVer[i];
 
     rclcpp::Logger::Level protocol_fault = rclcpp::Logger::Level::Debug; // none
     if (diff_protocol[0] != 0) protocol_fault = rclcpp::Logger::Level::Fatal; // major protocol changes -- BREAKING
@@ -758,13 +843,13 @@ bool InertialSenseROS::firmware_compatiblity_check()
             IS_SDK_VERSION_MAJOR,
             IS_SDK_VERSION_MINOR,
             IS_SDK_VERSION_REVIS,
-            IS_.DeviceInfo().protocolVer[0],
-            IS_.DeviceInfo().protocolVer[1],
-            IS_.DeviceInfo().protocolVer[2],
-            IS_.DeviceInfo().protocolVer[3],
-            IS_.DeviceInfo().firmwareVer[0],
-            IS_.DeviceInfo().firmwareVer[1],
-            IS_.DeviceInfo().firmwareVer[2]);
+            info.protocolVer[0],
+            info.protocolVer[1],
+            info.protocolVer[2],
+            info.protocolVer[3],
+            info.firmwareVer[0],
+            info.firmwareVer[1],
+            info.firmwareVer[2]);
     }
     return final_fault == rclcpp::Logger::Level::Debug; // true if they match, false if they don't.
 }
@@ -797,7 +882,10 @@ void InertialSenseROS::configure_flash_parameters()
 {
     bool reboot = false;
     nvm_flash_cfg_t current_flash_cfg;
-    IS_.ImxFlashConfig(current_flash_cfg);
+    if (device_)
+        device_->ImxFlashConfig(current_flash_cfg);
+    else
+        IS_.ImxFlashConfig(current_flash_cfg);
     //RCLCPP_INFO(rclcpp::get_logger("E"),"InertialSenseROS: Configuring flash: \nCurrent: %i, \nDesired: %i\n", current_flash_cfg.ioConfig, ioConfig_);
 
     if (current_flash_cfg.startupNavDtMs != ins_nav_dt_ms_)
@@ -865,116 +953,97 @@ void InertialSenseROS::configure_flash_parameters()
     }
 }
 
-// FIXME:: THESE SHOULD BE IN RtkRoverCorrectionProvider_Ntrip
 void InertialSenseROS::connect_rtk_client(RtkRoverCorrectionProvider_Ntrip& config)
 {
-    config.connecting_ = true;
+    ntrip_url_ = config.get_ntrip_url();
+    ntrip_ = std::make_unique<NtripCorrectionService>();
+    if (device_)
+        ntrip_->addDevice(device_);
+    config.connected_ = false;
+    config.connecting_ = false;
+    RCLCPP_INFO_STREAM(rclcpp::get_logger("successfully_connected_rtk"),
+        "InertialSenseROS: NTRIP rover configured [" << ntrip_url_ << "]. Connection deferred until GNSS 3D fix.");
+}
 
-    // [type]:[protocol]:[ip/url]:[port]:[mountpoint]:[username]:[password]
-    std::string RTK_connection = config.get_connection_string();
+void InertialSenseROS::maybeConnectNtrip()
+{
+    if (!ntrip_ || ntrip_url_.empty() || ntrip_->isConnected())
+        return;
+    if ((gps1_pos.status & GNSS_STATUS_FIX_MASK) < GNSS_STATUS_FIX_3D)
+        return;
 
-    int RTK_connection_attempt_count = 0;
-    while (++RTK_connection_attempt_count < config.connection_attempt_limit_)
+    RCLCPP_INFO_STREAM(rclcpp::get_logger("successfully_connected_rtk"),
+        "InertialSenseROS: Connecting NTRIP rover [" << ntrip_url_ << "]");
+    if (ntrip_->connect(ntrip_url_))
     {
-        config.connected_ = IS_.OpenConnectionToServer(RTK_connection);
-
-        int sleep_duration = RTK_connection_attempt_count * config.connection_attempt_backoff_;
-        if (config.connected_) {
-            RCLCPP_INFO_STREAM(rclcpp::get_logger("successfully_connected_rtk"),"InertialSenseROS: Successfully connected to RTK server [" << RTK_connection  << "]. [Attempt " << RTK_connection_attempt_count << "]");
-            break;
-        }
-        // fall-through
-
-        RCLCPP_ERROR_STREAM(rclcpp::get_logger("failed_to_connect_base"),"Failed to connect to base server at " << RTK_connection);
-        if (RTK_connection_attempt_count < config.connection_attempt_limit_) {
-            RCLCPP_WARN_STREAM(rclcpp::get_logger("unable_to_connect_reattempt"),"InertialSenseROS: Unable to establish connection with RTK server [" << RTK_connection << "] after attempt " << RTK_connection_attempt_count << ". Will try again in " << sleep_duration << " seconds.");
-       } else {
-           RCLCPP_ERROR_STREAM(rclcpp::get_logger("unable_to_connect_giveup"),"InertialSenseROS: Unable to establish connection with RTK server [" << RTK_connection << "] after attempt " << RTK_connection_attempt_count << ". Giving up.");
-       }
-       //rclcpp::Duration(sleep_duration,0).sleep(); // we will always sleep on a failure...
-       rclcpp::Rate r(sleep_duration); r.sleep();
-   }
-
-   config.connecting_ = false;
+        if (device_ && !ntrip_->hasDevice(device_))
+            ntrip_->addDevice(device_);
+        RCLCPP_INFO_STREAM(rclcpp::get_logger("successfully_connected_rtk"),
+            "InertialSenseROS: Successfully connected to NTRIP caster [" << ntrip_url_ << "]");
+    }
+    else
+    {
+        RCLCPP_ERROR_STREAM(rclcpp::get_logger("failed_to_connect_base"),
+            "Failed to connect to NTRIP caster at " << ntrip_url_ << " (core topics continue)");
+    }
 }
 
 void InertialSenseROS::rtk_connectivity_watchdog_timer_callback()
 {
     if ((RTK_rover_ == nullptr) || (RTK_rover_->correction_input == nullptr) || (RTK_rover_->correction_input->type_ != "ntrip"))
         return;
-
-    RtkRoverCorrectionProvider_Ntrip& config = *(RtkRoverCorrectionProvider_Ntrip*)(RTK_rover_->correction_input);
-    if (config.connecting_)
-    {
+    if (!ntrip_ || ntrip_url_.empty())
         return;
-    }
+    if ((gps1_pos.status & GNSS_STATUS_FIX_MASK) < GNSS_STATUS_FIX_3D)
+        return;
 
-    int latest_byte_count = IS_.ClientServerByteCount();
-    if (config.traffic_total_byte_count_ == latest_byte_count)
-    {
-        ++config.data_transmission_interruption_count_;
+    if (ntrip_->isConnected())
+        return;
 
-        if (config.data_transmission_interruption_count_ >= config.data_transmission_interruption_limit_)
-        {
-            if (config.traffic_time > 0.0)
-                RCLCPP_WARN_STREAM(rclcpp::get_logger("rtk_correction_try_again"),"Last received RTK correction data was " << (nh_->now().seconds() - config.traffic_time) << " seconds ago. Attempting to re-establish connection.");
-            connect_rtk_client(config);
-            if (config.connected_) {
-                config.traffic_total_byte_count_ = latest_byte_count;
-                config.data_transmission_interruption_count_ = 0;
-            }
-        } else {
-            if (config.traffic_time > 0.0)
-                RCLCPP_WARN_STREAM(rclcpp::get_logger("rtk_correction"),"Last received RTK correction data was " << (nh_->now().seconds() - config.traffic_time) << " seconds ago.");
-        }
-    }
-    else
-    {
-        config.traffic_time = nh_->now().seconds();
-        config.traffic_total_byte_count_ = latest_byte_count;
-        config.data_transmission_interruption_count_ = 0;
-    }
+    RCLCPP_WARN_STREAM(rclcpp::get_logger("rtk_correction_try_again"),
+        "NTRIP caster is disconnected. Attempting to re-establish connection.");
+    maybeConnectNtrip();
 }
 
 void InertialSenseROS::start_rtk_connectivity_watchdog_timer()
 {
-
     if ((RTK_rover_ == nullptr) || (RTK_rover_->correction_input == nullptr) || (RTK_rover_->correction_input->type_ != "ntrip"))
         return;
 
     RtkRoverCorrectionProvider_Ntrip& config = *(RtkRoverCorrectionProvider_Ntrip*)(RTK_rover_->correction_input);
-    rtk_connectivity_watchdog_timer_ = nh_->create_wall_timer(std::chrono::duration<float>(config.connectivity_watchdog_timer_frequency_) , std::bind(InertialSenseROS::rtk_connectivity_watchdog_timer_callback, this));
-    rtk_connectivity_watchdog_timer_->cancel();
-    if (!config.connectivity_watchdog_enabled_) {
+    if (!config.connectivity_watchdog_enabled_)
         return;
-    }
 
-    if (!rtk_connectivity_watchdog_timer_->is_canceled() == false) {
-        rtk_connectivity_watchdog_timer_ = nh_->create_wall_timer(std::chrono::duration<float>(config.connectivity_watchdog_timer_frequency_) , std::bind(InertialSenseROS::rtk_connectivity_watchdog_timer_callback, this));
-    }
-
-    rtk_connectivity_watchdog_timer_->reset();
+    rtk_connectivity_watchdog_timer_ = nh_->create_wall_timer(
+        std::chrono::duration<float>(config.connectivity_watchdog_timer_frequency_),
+        std::bind(&InertialSenseROS::rtk_connectivity_watchdog_timer_callback, this));
 }
 
 void InertialSenseROS::stop_rtk_connectivity_watchdog_timer()
 {
-    rtk_connectivity_watchdog_timer_->cancel();
-    if ((RTK_rover_ != nullptr) && (RTK_rover_->correction_input != nullptr) && (RTK_rover_->correction_input->type_ != "ntrip")) {
-        RtkRoverCorrectionProvider_Ntrip& config = *(RtkRoverCorrectionProvider_Ntrip*)(RTK_rover_->correction_input);
-        config.traffic_total_byte_count_ = 0;
-        config.data_transmission_interruption_count_ = 0;
-    }
+    if (rtk_connectivity_watchdog_timer_)
+        rtk_connectivity_watchdog_timer_->cancel();
 }
 
-// FIXME:: THIS SHOULD BE IN RtkBaseCorrectionProvider_Ntrip
 void InertialSenseROS::start_rtk_server(RtkBaseCorrectionProvider_Ntrip& config)
 {
-    // [type]:[ip/url]:[port]
-    std::string RTK_connection = config.get_connection_string();
-    if (IS_.CreateHost(RTK_connection))
-        RCLCPP_INFO_STREAM(rclcpp::get_logger("started_rtk_ntrip_server"),"InertialSenseROS: Successfully started RTK Base NTRIP correction server at" << RTK_connection);
-    else
-        RCLCPP_ERROR_STREAM(rclcpp::get_logger("failed_to_start_ntrip_server"),"InertialSenseROS: Failed to start RTK Base NTRIP correction server at " << RTK_connection);
+    if (!config.username_.empty() || !config.password_.empty() || !config.mount_point_.empty())
+    {
+        RCLCPP_WARN(rclcpp::get_logger("started_rtk_ntrip_server"),
+            "InertialSenseROS: NTRIP caster auth/mount is not supported; starting a TCP RTCM3 server on %s:%d",
+            config.ip_.c_str(), config.port_);
+    }
+
+    if (!device_)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("failed_to_start_ntrip_server"),
+            "InertialSenseROS: Cannot start RTCM3 correction server without a connected ISDevice");
+        return;
+    }
+
+    rtk_server_ = std::make_unique<Rtcm3CorrectionServer>(device_, config.port_, config.ip_);
+    RCLCPP_INFO_STREAM(rclcpp::get_logger("started_rtk_ntrip_server"),
+        "InertialSenseROS: Started RTCM3 correction server at " << config.ip_ << ":" << config.port_);
 }
 
 
@@ -1579,6 +1648,16 @@ void InertialSenseROS::GPS_pos_callback(eDataIDs DID, const gnss_pos_t *const ms
             msg_gps1.pdop = msg->pDop;
             publishGPS1();
         }
+
+        if (ntrip_ && ntrip_->isConnected() && ((msg->status & GNSS_STATUS_FIX_MASK) >= GNSS_STATUS_FIX_3D))
+        {
+            time_t now = time(nullptr);
+            if (last_ntrip_gga_time_ == 0 || labs(now - last_ntrip_gga_time_) >= 5)
+            {
+                last_ntrip_gga_time_ = now;
+                ntrip_->updatePosition(*msg);
+            }
+        }
         break;
 
     case DID_GNSS2_POS:
@@ -1617,17 +1696,17 @@ void InertialSenseROS::GPS_pos_callback(eDataIDs DID, const gnss_pos_t *const ms
             msg_NavSatFix.header.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeekMs / 1.0e3);
             msg_NavSatFix.header.frame_id = frame_id_;
             msg_NavSatFix.status.status = -1;                           // Assume no Fix
-            if (msg->status & GNSS_STATUS_FIX_MASK >= GNSS_STATUS_FIX_2D) // Check for fix and set
+            if ((msg->status & GNSS_STATUS_FIX_MASK) >= GNSS_STATUS_FIX_2D)
             {
                 msg_NavSatFix.status.status = NavSatFixStatusFixType::STATUS_FIX;
             }
 
-            if (msg->status & GNSS_STATUS_FIX_SBAS) // Check for SBAS only fix
+            if ((msg->status & GNSS_STATUS_FIX_MASK) == GNSS_STATUS_FIX_SBAS)
             {
                 msg_NavSatFix.status.status = NavSatFixStatusFixType::STATUS_SBAS_FIX;
             }
 
-            if (msg->status & GNSS_STATUS_FIX_MASK >= GNSS_STATUS_FIX_RTK_SINGLE) // Check for any RTK fix
+            if ((msg->status & GNSS_STATUS_FIX_MASK) >= GNSS_STATUS_FIX_RTK_SINGLE)
             {
                 msg_NavSatFix.status.status = NavSatFixStatusFixType::STATUS_GBAS_FIX;
             }
@@ -1722,13 +1801,22 @@ void InertialSenseROS::publishGPS2()
 void InertialSenseROS::update()
 {
     if (!IS_.IsOpen()) {
+        ntrip_.reset();
+        rtk_server_.reset();
+        resetDeviceBinding();
         IS_.Close();
         sdk_connected_ = false;
         sleep(1);
         initializeIS();
+        return;
     }
 
     IS_.Update();
+    maybeConnectNtrip();
+    if (ntrip_ && ntrip_->isConnected())
+        ntrip_->step();
+    if (rtk_server_)
+        rtk_server_->step();
 }
 
 void InertialSenseROS::strobe_in_time_callback(eDataIDs DID, const strobe_in_time_t *const msg)
@@ -1915,28 +2003,28 @@ void InertialSenseROS::RTK_Rel_callback(eDataIDs DID, const gnss_rtk_rel_t *cons
         uint32_t fixStatus = msg->status & GNSS_STATUS_FIX_MASK;
         if (fixStatus == GNSS_STATUS_FIX_3D)
         {
-            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GNSS_STATUS_FIX_3D;
-            fixStatusString = "GNSS_STATUS_FIX_3D";
+            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GPS_STATUS_FIX_3D;
+            fixStatusString = "GPS_STATUS_FIX_3D";
         }
         else if (fixStatus == GNSS_STATUS_FIX_RTK_SINGLE)
         {
-            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GNSS_STATUS_FIX_RTK_SINGLE;
-            fixStatusString = "GNSS_STATUS_FIX_RTK_SINGLE";
+            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GPS_STATUS_FIX_RTK_SINGLE;
+            fixStatusString = "GPS_STATUS_FIX_RTK_SINGLE";
         }
         else if (fixStatus == GNSS_STATUS_FIX_RTK_FLOAT)
         {
-            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GNSS_STATUS_FIX_RTK_FLOAT;
-            fixStatusString = "GNSS_STATUS_FIX_RTK_FLOAT";
+            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GPS_STATUS_FIX_RTK_FLOAT;
+            fixStatusString = "GPS_STATUS_FIX_RTK_FLOAT";
         }
         else if (fixStatus == GNSS_STATUS_FIX_RTK_FIX)
         {
-            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GNSS_STATUS_FIX_RTK_FIX;
-            fixStatusString = "GNSS_STATUS_FIX_RTK_FIX";
+            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GPS_STATUS_FIX_RTK_FIX;
+            fixStatusString = "GPS_STATUS_FIX_RTK_FIX";
         }
         else if (msg->status & GNSS_STATUS_FLAGS_RTK_FIX_AND_HOLD)
         {
-            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GNSS_STATUS_FLAGS_RTK_FIX_AND_HOLD;
-            fixStatusString = "GNSS_STATUS_FLAGS_RTK_FIX_AND_HOLD";
+            rtk_rel.e_gps_status_fix = inertial_sense_ros2::msg::RTKRel::GPS_STATUS_FLAGS_RTK_FIX_AND_HOLD;
+            fixStatusString = "GPS_STATUS_FLAGS_RTK_FIX_AND_HOLD";
         }
 
         rtk_rel.vector_base_to_rover.x = msg->baseToRoverVector[0];
@@ -2301,7 +2389,10 @@ bool InertialSenseROS::set_current_position_as_refLLA(std_srvs::srv::Trigger::Re
 
     int i = 0;
     nvm_flash_cfg_t current_flash;
-    IS_.ImxFlashConfig(current_flash);
+    if (device_)
+        device_->ImxFlashConfig(current_flash);
+    else
+        IS_.ImxFlashConfig(current_flash);
     while (current_flash.refLla[0] == current_flash.refLla[0] && current_flash.refLla[1] == current_flash.refLla[1] && current_flash.refLla[2] == current_flash.refLla[2])
     {
         comManagerStep();
@@ -2336,7 +2427,10 @@ bool InertialSenseROS::set_refLLA_to_value(inertial_sense_ros2::srv::RefLLAUpdat
 
     int i = 0;
     nvm_flash_cfg_t current_flash;
-    IS_.ImxFlashConfig(current_flash);
+    if (device_)
+        device_->ImxFlashConfig(current_flash);
+    else
+        IS_.ImxFlashConfig(current_flash);
     while (current_flash.refLla[0] == current_flash.refLla[0] && current_flash.refLla[1] == current_flash.refLla[1] && current_flash.refLla[2] == current_flash.refLla[2])
     {
         comManagerStep();
@@ -2375,7 +2469,7 @@ bool InertialSenseROS::perform_mag_cal_srv_callback(std_srvs::srv::Trigger::Requ
     is_comm_enable_protocol(&comm, _PTYPE_INERTIAL_SENSE_DATA);
     is_comm_enable_protocol(&comm, _PTYPE_NMEA);
 
-    std::vector<port_handle_t> ports = IS_.getPorts();
+    std::set<port_handle_t> ports = IS_.getPorts();
     uint8_t inByte;
     int n;
     
@@ -2412,7 +2506,7 @@ bool InertialSenseROS::perform_multi_mag_cal_srv_callback(std_srvs::srv::Trigger
     is_comm_enable_protocol(&comm, _PTYPE_INERTIAL_SENSE_DATA);
     is_comm_enable_protocol(&comm, _PTYPE_NMEA);
 
-    std::vector<port_handle_t> ports = IS_.getPorts();
+    std::set<port_handle_t> ports = IS_.getPorts();
     uint8_t inByte;
     int n;
 

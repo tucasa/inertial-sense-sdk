@@ -25,10 +25,16 @@
 #include <algorithm>
 #include <string>
 #include <cstdlib>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <ctime>
 #include <yaml-cpp/yaml.h>
 
 #include "data_sets.h"
 #include "InertialSense.h"
+#include "NtripCorrectionService.h"
+#include "Rtcm3CorrectionServer.h"
 #include "version/version.h"
 
 #include "RtkBase.h"
@@ -113,14 +119,14 @@ using namespace std::chrono_literals;
 #define LEAP_SECONDS 18           // GPS time does not have leap seconds, UNIX does (as of 1/1/2017 - next one is probably in 2020 sometime unless there is some crazy earthquake or nuclear blast)
 #define UNIX_TO_GPS_OFFSET (GPS_UNIX_OFFSET - LEAP_SECONDS)
 
-// TODO: Replace this macro with an equivelent method in ISDevice::registerDataHandler(uint8_t dataId, callback) and update project.
-//#define SET_CALLBACK(DID, __type, __cb_fun, __periodmultiple)                                                   \
-//    IS_.BroadcastBinaryData((eDataIDs)(DID), (int)(__periodmultiple),                                           \
-//                            [this](InertialSense *i, p_data_t *data, void *port)                                \
-//                            {                                                                                   \
-//                              /* RCLCPP_INFO(rclcpp::get_logger("got_message"),"Got message %d", DID);      */  \
-//                                this->__cb_fun((eDataIDs)DID, reinterpret_cast<__type *>(data->ptr));           \
-//                            })
+#define SET_CALLBACK(DID, __type, __cb_fun, __periodmultiple)                                                   \
+    do {                                                                                                        \
+        did_callbacks_[(uint32_t)(DID)] = [this](p_data_t *data) {                                              \
+            this->__cb_fun((eDataIDs)(DID), reinterpret_cast<__type *>(data->ptr));                             \
+        };                                                                                                      \
+        if (device_ && device_->isConnected())                                                                  \
+            device_->BroadcastBinaryData((uint32_t)(DID), (int)(__periodmultiple));                             \
+    } while (0)
 
 
 class InertialSenseROS //: SerialListener
@@ -156,6 +162,12 @@ public:
     void configure_rtk();
     void connect_rtk_client(RtkRoverCorrectionProvider_Ntrip& config);
     void start_rtk_server(RtkBaseCorrectionProvider_Ntrip& config);
+    void resetDeviceBinding();
+    bool bindConnectedDevice();
+    void ensureIsbHandler();
+    int isbDispatch(void* ctx, p_data_t* data, port_handle_t port);
+    static int isbDispatchThunk(void* ctx, p_data_t* data, port_handle_t port);
+    void maybeConnectNtrip();
 
     void configure_data_streams(bool firstrun);
 #ifdef ROS2
@@ -237,8 +249,8 @@ public:
     GNSSObsVec gps2_obs_Vec_;
     GNSSObsVec base_obs_Vec_;
 #endif
-    RtkRoverProvider* RTK_rover_;
-    RtkBaseProvider* RTK_base_;
+    RtkRoverProvider* RTK_rover_ = nullptr;
+    RtkBaseProvider* RTK_base_ = nullptr;
 
     bool GNSS_Compass_ = false;
 
@@ -509,14 +521,23 @@ public:
     GPSInfo msg_gps1_info;
     GPSInfo msg_gps2_info;
 #endif
-    gnss_pos_t gps1_pos;
-    gnss_pos_t gps2_pos;
-    gnss_vel_t gps1_vel;
-    gnss_vel_t gps2_vel;
+    gnss_pos_t gps1_pos = {};
+    gnss_pos_t gps2_pos = {};
+    gnss_vel_t gps1_vel = {};
+    gnss_vel_t gps2_vel = {};
     float poseCov_[36], twistCov_[36];
 
     // Connection to the uINS
     InertialSense IS_;
+    device_handle_t device_;
+    bool isb_handler_installed_ = false;
+    std::unordered_map<uint32_t, std::function<void(p_data_t*)>> did_callbacks_;
+    static InertialSenseROS* s_isb_owner_;
+
+    std::unique_ptr<NtripCorrectionService> ntrip_;
+    std::unique_ptr<Rtcm3CorrectionServer> rtk_server_;
+    std::string ntrip_url_;
+    time_t last_ntrip_gga_time_ = 0;
 
     // Flash parameters
     // navigation_dt_ms, EKF update period.  IMX-5:  16 default, 8 max.  Use `msg/ins.../period` to reduce INS output data rate.

@@ -60,6 +60,7 @@ public:
     RtkRoverCorrectionProvider_Ntrip(YAML::Node& node) : RtkRoverCorrectionProvider(node, "ntrip") { configure(node); }
     void configure(YAML::Node& node);
     std::string get_connection_string();
+    std::string get_ntrip_url() const;
     void connect_rtk_client();
     void start_connectivity_watchdog_timer();
     void stop_connectivity_watchdog_timer();
