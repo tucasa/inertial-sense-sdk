@@ -19,24 +19,25 @@ find_package(Threads)
 
 add_definitions(-DROS2)
 
-get_filename_component(RESOLVED_ROS_DIR ${CMAKE_SOURCE_DIR} REALPATH) # Symlink hell
+get_filename_component(RESOLVED_ROS_DIR ${CMAKE_SOURCE_DIR} REALPATH)
+get_filename_component(SDK_ROOT "${RESOLVED_ROS_DIR}/../.." ABSOLUTE)
+set(ABSOLUTE_SCRIPT_PATH "${SDK_ROOT}/scripts/build_is_sdk.sh")
+set(IS_SDK_LIB "${SDK_ROOT}/build/libInertialSenseSDK.a")
 message(RESOLVED_ROS_DIR="${RESOLVED_ROS_DIR}")
-
-set(RELATIVE_SCRIPT_PATH "${CMAKE_CURRENT_LIST_DIR}/../inertial-sense-sdk/scripts/build_is_sdk.sh")
-get_filename_component(ABSOLUTE_SCRIPT_PATH ${RELATIVE_SCRIPT_PATH} ABSOLUTE BASE_DIR ${CMAKE_SOURCE_DIR})
+message(SDK_ROOT="${SDK_ROOT}")
 message(ABSOLUTE_SCRIPT_PATH="${ABSOLUTE_SCRIPT_PATH}")
 
-add_custom_command(OUTPUT ${RESOLVED_ROS_DIR}/../../build/libInertialSenseSDK.a
+add_custom_command(OUTPUT ${IS_SDK_LIB}
     COMMAND ${CMAKE_COMMAND} -E env bash ${ABSOLUTE_SCRIPT_PATH}
     COMMENT "Running custom shell script..."
     VERBATIM
 )
 
-add_custom_target(build_InertialSenseSDK DEPENDS ${RESOLVED_ROS_DIR}/../../build/libInertialSenseSDK.a)
+add_custom_target(build_InertialSenseSDK DEPENDS ${IS_SDK_LIB})
 
 add_library(InertialSenseSDK STATIC IMPORTED GLOBAL)
 add_dependencies(InertialSenseSDK build_InertialSenseSDK)
-set_target_properties(InertialSenseSDK PROPERTIES IMPORTED_LOCATION ${RESOLVED_ROS_DIR}/../../build/libInertialSenseSDK.a)
+set_target_properties(InertialSenseSDK PROPERTIES IMPORTED_LOCATION ${IS_SDK_LIB})
 
 rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/GTime.msg"
@@ -65,17 +66,28 @@ ament_export_dependencies(rclcpp sensor_msgs geometry_msgs std_msgs diagnostic_m
 # We don't need the example projects
 set(IGNORE_EXAMPLE_PROJECTS 1)
 
+# ROS 2 Humble+ uses per-package include dirs. Some headers in this package
+# also include via <install>/include/<pkg>/<pkg>/..., so add the parent include root.
+list(GET rclcpp_INCLUDE_DIRS 0 _rclcpp_include_dir)
+get_filename_component(ROS_INCLUDE_ROOT "${_rclcpp_include_dir}" DIRECTORY)
+
 include_directories(
     shared/include
     ${XMLRPC_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIR}
-    ../../src #This line of CMakeList.txt stays in .external file to reference submodule
-    ../../src/libusb/libusb
-    ../../src/libusb/linux
-    ../../src/yaml-cpp
-    ../ros2/build/inertial_sense_ros2/rosidl_generator_cpp/
-    /opt/ros/jazzy/include
-    /opt/ros/jazzy/include/sensor_msgs
+    ${SDK_ROOT}/src
+    ${SDK_ROOT}/src/libusb/libusb
+    ${SDK_ROOT}/src/libusb/linux
+    ${SDK_ROOT}/src/yaml-cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp
+    ${ROS_INCLUDE_ROOT}
+    ${rclcpp_INCLUDE_DIRS}
+    ${sensor_msgs_INCLUDE_DIRS}
+    ${std_msgs_INCLUDE_DIRS}
+    ${geometry_msgs_INCLUDE_DIRS}
+    ${nav_msgs_INCLUDE_DIRS}
+    ${diagnostic_msgs_INCLUDE_DIRS}
+    ${std_srvs_INCLUDE_DIRS}
 )
 
 # Build using C11 and CXX20
