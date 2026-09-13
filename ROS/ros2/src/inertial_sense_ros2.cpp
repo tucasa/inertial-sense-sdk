@@ -135,11 +135,11 @@ void InertialSenseROS::initializeROS()
     multi_mag_cal_srv_              = nh_->create_service<std_srvs::srv::Trigger>("multi_axis_mag_cal", std::bind(&InertialSenseROS::perform_multi_mag_cal_srv_callback, this, std::placeholders::_1, std::placeholders::_2));
     //firmware_update_srv_            = nh_.advertiseService("firmware_update", &InertialSenseROS::update_firmware_srv_callback, this);
 
-    SET_CALLBACK(DID_STROBE_IN_TIME, strobe_in_time_t, strobe_in_time_callback, 0); // we always want the strobe
-
-    //////////////////////////////////////////////////////////
-    // Publishers
-    strobe_pub_ = nh_->create_publisher<std_msgs::msg::Header>(rs_.strobe_in.topic, 1);
+    if (rs_.strobe_in.enabled)
+    {
+        SET_CALLBACK(DID_STROBE_IN_TIME, strobe_in_time_t, strobe_in_time_callback, 0);
+        strobe_pub_ = nh_->create_publisher<std_msgs::msg::Header>(rs_.strobe_in.topic, 1);
+    }
 
     if (rs_.did_ins1.enabled)
         { rs_.did_ins1.pub_didins1    = nh_->create_publisher<inertial_sense_ros2::msg::DIDINS1>(rs_.did_ins1.topic, 1); }
@@ -534,7 +534,6 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 
         SET_CALLBACK(DID_INS_4, ins_4_t, INS4_callback, rs_.did_ins4.period);                     // Need NED
         SET_CALLBACK(DID_PIMU, pimu_t, preint_IMU_callback, rs_.pimu.period);                     // Need angular rate data from IMU
-        rs_.imu.enabled = true;
         odometryIdentity(msg_odom_ned);
         if (!firstrun)
             return;;
@@ -547,7 +546,6 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
         RCLCPP_DEBUG(logger_odom_ins_ecef,"InertialSenseROS: Attempting to enable odom INS ECEF data stream");
         SET_CALLBACK(DID_INS_4, ins_4_t, INS4_callback, rs_.did_ins4.period);                     // Need quaternion and ecef
         SET_CALLBACK(DID_PIMU, pimu_t, preint_IMU_callback, rs_.pimu.period);                     // Need angular rate data from IMU
-        rs_.imu.enabled = true;
         odometryIdentity(msg_odom_ecef);
         if (!firstrun)
             return;
@@ -560,7 +558,6 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
         RCLCPP_DEBUG(logger_odom_ins_enu,"InertialSenseROS: Attempting to enable odom INS ENU data stream");
         SET_CALLBACK(DID_INS_4, ins_4_t, INS4_callback, rs_.did_ins4.period);                     // Need ENU
         SET_CALLBACK(DID_PIMU, pimu_t, preint_IMU_callback, rs_.pimu.period);                     // Need angular rate data from IMU
-        rs_.imu.enabled = true;
         odometryIdentity(msg_odom_enu);
         if (!firstrun)
             return;
@@ -649,6 +646,13 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
     CONFIG_STREAM(rs_.magnetometer, DID_MAGNETOMETER, magnetometer_t, mag_callback);
     CONFIG_STREAM(rs_.barometer, DID_BAROMETER, barometer_t, baro_callback);
     CONFIG_STREAM(rs_.pimu, DID_PIMU, pimu_t, preint_IMU_callback);
+    // /imu is derived from DID_PIMU. Subscribe even when /pimu is disabled.
+    if (rs_.imu.enabled && !imuStreaming_)
+    {
+        SET_CALLBACK(DID_PIMU, pimu_t, preint_IMU_callback, rs_.imu.period);
+        if (!firstrun)
+            return;
+    }
     CONFIG_STREAM(rs_.imu_raw, DID_IMU_RAW, imu_t, imu_raw_callback);
 
     if (!firstrun)
@@ -1826,7 +1830,7 @@ void InertialSenseROS::strobe_in_time_callback(eDataIDs DID, const strobe_in_tim
     case DID_STROBE_IN_TIME:
        // STREAMING_CHECK(strobeInStreaming_, DID);
 
-        if (abs(GPS_towOffset_) > 0.001)
+        if (rs_.strobe_in.enabled && strobe_pub_ && abs(GPS_towOffset_) > 0.001)
         {
             auto strobe_msg = std_msgs::msg::Header();
             strobe_msg.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeekMs * 1.0e-3);
@@ -1907,7 +1911,21 @@ void InertialSenseROS::preint_IMU_callback(eDataIDs DID, const pimu_t *const msg
 {
     imuStreaming_ = true;
 
-    if (rs_.pimu.enabled)
+    // Always keep msg_imu current for odom_ins_* twist.angular. Publishing /imu is independent.
+    msg_imu.header.stamp = ros_time_from_start_time(msg->time);
+    msg_imu.header.frame_id = frame_id_;
+    if (msg->dt != 0.0f)
+    {
+        float div = 1.0f/msg->dt;
+        msg_imu.angular_velocity.x = msg->theta[0]  * div;
+        msg_imu.angular_velocity.y = msg->theta[1]  * div;
+        msg_imu.angular_velocity.z = msg->theta[2]  * div;
+        msg_imu.linear_acceleration.x = msg->vel[0] * div;
+        msg_imu.linear_acceleration.y = msg->vel[1] * div;
+        msg_imu.linear_acceleration.z = msg->vel[2] * div;
+    }
+
+    if (rs_.pimu.enabled && rs_.pimu.pub_pimu)
     {
         rs_.pimu.streamingCheck(DID);
         msg_pimu.header.stamp = ros_time_from_start_time(msg->time);
@@ -1922,22 +1940,10 @@ void InertialSenseROS::preint_IMU_callback(eDataIDs DID, const pimu_t *const msg
         rs_.pimu.pub_pimu->publish(msg_pimu);
     }
 
-    if (rs_.imu.enabled)
+    if (rs_.imu.enabled && rs_.imu.pub_imu && msg->dt != 0.0f)
     {
         rs_.imu.streamingCheck(DID);
-        msg_imu.header.stamp = ros_time_from_start_time(msg->time);
-        msg_imu.header.frame_id = frame_id_;
-        if (msg->dt != 0.0f)
-        {
-            float div = 1.0f/msg->dt;
-            msg_imu.angular_velocity.x = msg->theta[0]  * div;
-            msg_imu.angular_velocity.y = msg->theta[1]  * div;
-            msg_imu.angular_velocity.z = msg->theta[2]  * div;
-            msg_imu.linear_acceleration.x = msg->vel[0] * div;
-            msg_imu.linear_acceleration.y = msg->vel[1] * div;
-            msg_imu.linear_acceleration.z = msg->vel[2] * div;
-            rs_.imu.pub_imu->publish(msg_imu);
-        }
+        rs_.imu.pub_imu->publish(msg_imu);
     }
 }
 
